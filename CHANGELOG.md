@@ -9,18 +9,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-15
+
 ### Changed
 
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
 - Bumped `tokio` to `1.53`, `regex` to `1.13`, `base64` to `0.23`, and `uuid` to `1.26`. No source changes were needed; the crate's use of these dependencies (`base64::Engine`, `regex::Regex`, `uuid::Uuid::new_v4`) is unaffected by the version bumps.
-
-### Fixed
-
-- **Breaking:** `Tenant::with_schema` validates the identifier and returns a `Result`. It was forwarded verbatim to `SET search_path`, which is how tenant isolation gets bypassed.
-- Path-based tenant resolution matches `path_only()`; any request carrying a query string previously failed to resolve.
-
-### Changed — `0.3.0` → `0.3.1`
-
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
 
 ## [0.5.0] - 2026-08-05
 

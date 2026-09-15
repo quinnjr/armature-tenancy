@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped `tokio` to `1.53`, `regex` to `1.13`, `base64` to `0.23`, and `uuid` to `1.26`. No source changes were needed; the crate's use of these dependencies (`base64::Engine`, `regex::Regex`, `uuid::Uuid::new_v4`) is unaffected by the version bumps.
+
 ### Fixed
 
 - **Breaking:** `Tenant::with_schema` validates the identifier and returns a `Result`. It was forwarded verbatim to `SET search_path`, which is how tenant isolation gets bypassed.

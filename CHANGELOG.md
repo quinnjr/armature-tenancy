@@ -9,6 +9,28 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-17
+
+### Security
+
+- **H14 — tenant IDOR closed.** `TenantMiddleware` now binds the resolved tenant to the authenticated principal: it requires the verified `armature_auth::UserContext` that `JwtAuthMiddleware` attaches (missing → `401`) and rejects a tenant that is not among the principal's tenants (`403`). Memberships are read from the verified claims in `UserContext::metadata` — the `tenants` claim (array or single string), else `tenant_id` — configurable via the new `TenantMembership`. A caller authenticated for tenant A can no longer reach tenant B by sending `X-Tenant-ID: B`, a different subdomain or path.
+- `JwtTenantResolver` no longer base64-decodes the raw `Authorization` header (which accepted forged, unsigned tokens). It reads the claim only from the verified `UserContext`; the claim may be a string or a one-element array.
+- `TenantMiddleware` discards any `TenantContext` already present on the request before resolving, so a preset context can never survive.
+
+### Added
+
+- `TenantMembership` (claim layout for principal tenant memberships).
+- `TenantMiddleware::public_unverified` for public, unauthenticated per-tenant pages: resolves without principal binding and is documented as *not* an authorization check.
+- `TenantContext::is_principal_bound`.
+
+### Changed
+
+- **Breaking:** `TenantMiddleware::new` requires `armature_auth::JwtAuthMiddleware` (or anything inserting a verified `UserContext`) to run first. Migration: register `JwtAuthMiddleware` before `TenantMiddleware` and put the user's tenant ids in a `tenants` claim; use `public_unverified` for anonymous pages.
+- **Breaking:** `JwtTenantResolver` resolves only from the verified `UserContext`. Migration: register `JwtAuthMiddleware` first.
+- **Breaking:** `HeaderTenantResolver::new` is renamed `HeaderTenantResolver::trusted_internal` to mark that it belongs behind a gateway that sets the header; principal binding still applies.
+- `optional` mode only tolerates an *unresolved* tenant; a resolved tenant the principal is not a member of is still rejected with `403`.
+- New dependency on `armature-auth` 0.4 (default features off). `base64` is now a dev-dependency only.
+
 ## [0.6.0] - 2026-09-15
 
 ### Changed

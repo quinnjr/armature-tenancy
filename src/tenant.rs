@@ -194,19 +194,51 @@ impl Tenant {
 #[derive(Debug, Clone)]
 pub struct TenantContext {
     tenant: Option<Tenant>,
+    /// `true` only when [`crate::TenantMiddleware`] verified that the
+    /// authenticated principal is a member of `tenant`.
+    principal_bound: bool,
 }
 
 impl TenantContext {
     /// Create empty tenant context
     pub fn new() -> Self {
-        Self { tenant: None }
+        Self {
+            tenant: None,
+            principal_bound: false,
+        }
     }
 
-    /// Create with tenant
+    /// Create with tenant.
+    ///
+    /// The resulting context is **not** marked as bound to an authenticated
+    /// principal (see [`is_principal_bound`](Self::is_principal_bound)); only
+    /// [`crate::TenantMiddleware`] produces bound contexts.
     pub fn with_tenant(tenant: Tenant) -> Self {
         Self {
             tenant: Some(tenant),
+            principal_bound: false,
         }
+    }
+
+    /// Context for a tenant whose membership was verified against the
+    /// authenticated principal.
+    pub(crate) fn bound_to_principal(tenant: Tenant) -> Self {
+        Self {
+            tenant: Some(tenant),
+            principal_bound: true,
+        }
+    }
+
+    /// Whether the tenant was verified to be one the authenticated principal
+    /// belongs to.
+    ///
+    /// `false` for contexts built by [`TenantMiddleware::public_unverified`]
+    /// (or by hand): such a tenant is a routing hint only and must not be used
+    /// to authorize access to tenant data.
+    ///
+    /// [`TenantMiddleware::public_unverified`]: crate::TenantMiddleware::public_unverified
+    pub fn is_principal_bound(&self) -> bool {
+        self.principal_bound
     }
 
     /// Get tenant
@@ -215,8 +247,11 @@ impl TenantContext {
     }
 
     /// Set tenant
+    ///
+    /// Replacing the tenant clears the principal binding.
     pub fn set_tenant(&mut self, tenant: Tenant) {
         self.tenant = Some(tenant);
+        self.principal_bound = false;
     }
 
     /// Get tenant ID

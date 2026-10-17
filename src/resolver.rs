@@ -3,6 +3,7 @@
 //! Strategies for resolving tenant from HTTP requests.
 
 use crate::tenant::Tenant;
+use armature_auth::UserContext;
 use armature_core::HttpRequest;
 use async_trait::async_trait;
 use regex::Regex;
@@ -52,16 +53,26 @@ pub trait TenantStore: Send + Sync {
     async fn find_by_domain(&self, domain: &str) -> Result<Option<Tenant>, TenantError>;
 }
 
-/// Header-based tenant resolver
+/// Header-based tenant resolver for **trusted, internal** traffic only.
 ///
-/// Resolves tenant from a request header (e.g., `X-Tenant-ID`).
+/// Resolves tenant from a request header (e.g., `X-Tenant-ID`). A client can
+/// put any value in a header, so this resolver only selects *which* tenant the
+/// request is about; it never proves the caller may access it.
+/// [`crate::TenantMiddleware`] still binds the resolved tenant to the verified
+/// principal's tenant memberships, so a caller authenticated for tenant `A`
+/// sending `X-Tenant-ID: B` is rejected with `403`.
+///
+/// Use it only behind a gateway/service mesh that sets the header itself and
+/// strips client-supplied copies. There is deliberately no `new`: the
+/// constructor is named [`trusted_internal`](Self::trusted_internal) so that
+/// choosing this resolver is an explicit decision.
 pub struct HeaderTenantResolver {
     store: Arc<dyn TenantStore>,
     header_name: String,
 }
 
 impl HeaderTenantResolver {
-    /// Create new header-based resolver
+    /// Create a header-based resolver for trusted, internal traffic.
     ///
     /// # Examples
     ///
@@ -77,9 +88,9 @@ impl HeaderTenantResolver {
     /// #     async fn find_by_domain(&self, domain: &str) -> Result<Option<armature_tenancy::Tenant>, armature_tenancy::TenantError> { Ok(None) }
     /// # }
     /// let store: Arc<dyn armature_tenancy::TenantStore> = Arc::new(MyTenantStore);
-    /// let resolver = HeaderTenantResolver::new(store, "X-Tenant-ID");
+    /// let resolver = HeaderTenantResolver::trusted_internal(store, "X-Tenant-ID");
     /// ```
-    pub fn new(store: Arc<dyn TenantStore>, header_name: impl Into<String>) -> Self {
+    pub fn trusted_internal(store: Arc<dyn TenantStore>, header_name: impl Into<String>) -> Self {
         Self {
             store,
             header_name: header_name.into(),
@@ -189,21 +200,16 @@ impl TenantResolver for SubdomainTenantResolver {
 
 /// JWT claim-based tenant resolver
 ///
-/// Resolves tenant from JWT token claims.
+/// Resolves the tenant from a claim of the **verified** token: it reads the
+/// [`UserContext`] request extension that `armature_auth::JwtAuthMiddleware`
+/// inserts after checking the token's signature and expiry (the full verified
+/// claim set lives in [`UserContext::metadata`]). The raw `Authorization`
+/// header is never decoded, so a forged or unsigned token cannot select a
+/// tenant. `JwtAuthMiddleware` must therefore run before
+/// [`crate::TenantMiddleware`].
 ///
-/// # Security
-///
-/// **This resolver does NOT verify the JWT signature.** It only splits the
-/// token and base64url-decodes the payload segment to read the configured
-/// claim. Anyone can forge an unsigned payload, so this resolver MUST be
-/// deployed behind authentication middleware (e.g. `armature-auth` /
-/// `armature-jwt`) that has already verified the token's signature and
-/// expiration. Tenant resolution from an unverified JWT is only safe
-/// post-authentication; never use this resolver as an authentication or
-/// authorization mechanism on its own.
-///
-/// Malformed tokens fail closed: any structural, encoding, or JSON error
-/// results in a resolution error, never a default tenant.
+/// The claim must be a non-empty string, or an array holding exactly one
+/// non-empty string. Anything else fails closed.
 pub struct JwtTenantResolver {
     store: Arc<dyn TenantStore>,
     claim_name: String,
@@ -234,25 +240,41 @@ impl JwtTenantResolver {
             claim_name: claim_name.into(),
         }
     }
+
+    /// Read the configured claim from the verified claim set.
+    fn extract_claim(&self, user: &UserContext) -> Result<String, TenantError> {
+        let invalid = || {
+            TenantError::Invalid(format!(
+                "claim '{}' is not a non-empty string",
+                self.claim_name
+            ))
+        };
+        match user.metadata.get(&self.claim_name) {
+            Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(value.clone()),
+            Some(serde_json::Value::Array(items)) => match items.as_slice() {
+                [serde_json::Value::String(value)] if !value.is_empty() => Ok(value.clone()),
+                _ => Err(invalid()),
+            },
+            Some(_) => Err(invalid()),
+            None => Err(TenantError::ResolutionFailed(format!(
+                "verified token is missing the '{}' claim",
+                self.claim_name
+            ))),
+        }
+    }
 }
 
 #[async_trait]
 impl TenantResolver for JwtTenantResolver {
     async fn resolve(&self, request: &HttpRequest) -> Result<Tenant, TenantError> {
-        // Extract JWT from Authorization header
-        let auth_header = request.headers.get("authorization").ok_or_else(|| {
-            TenantError::ResolutionFailed("Missing Authorization header".to_string())
+        let user = request.extensions.get::<UserContext>().ok_or_else(|| {
+            TenantError::ResolutionFailed(
+                "no verified UserContext on the request (is JwtAuthMiddleware registered first?)"
+                    .to_string(),
+            )
         })?;
 
-        // Extract token (assumes "Bearer <token>")
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| TenantError::Invalid("Invalid Authorization format".to_string()))?;
-
-        // Parse the JWT payload WITHOUT signature verification (see the
-        // security note on this type): an authentication layer must already
-        // have verified this token before tenant resolution runs.
-        let tenant_id = self.extract_claim(token)?;
+        let tenant_id = self.extract_claim(user)?;
 
         let tenant = self
             .store
@@ -265,50 +287,6 @@ impl TenantResolver for JwtTenantResolver {
         }
 
         Ok(tenant)
-    }
-}
-
-impl JwtTenantResolver {
-    /// Extract the configured claim from the JWT payload.
-    ///
-    /// **Does NOT verify the signature** — see the security note on
-    /// [`JwtTenantResolver`]. Fails closed on any malformed input.
-    fn extract_claim(&self, token: &str) -> Result<String, TenantError> {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        // A compact JWS is exactly three dot-separated segments.
-        let mut segments = token.split('.');
-        let (Some(_header), Some(payload), Some(_signature), None) = (
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next(),
-        ) else {
-            return Err(TenantError::Invalid(
-                "Malformed JWT: expected three segments".to_string(),
-            ));
-        };
-
-        // Payload is base64url; tolerate (strip) any trailing padding.
-        let payload_bytes = URL_SAFE_NO_PAD
-            .decode(payload.trim_end_matches('='))
-            .map_err(|_| TenantError::Invalid("Malformed JWT payload encoding".to_string()))?;
-
-        let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
-            .map_err(|_| TenantError::Invalid("Malformed JWT payload JSON".to_string()))?;
-
-        match claims.get(&self.claim_name) {
-            Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(value.clone()),
-            Some(_) => Err(TenantError::Invalid(format!(
-                "JWT claim '{}' is not a non-empty string",
-                self.claim_name
-            ))),
-            None => Err(TenantError::ResolutionFailed(format!(
-                "JWT is missing the '{}' claim",
-                self.claim_name
-            ))),
-        }
     }
 }
 
@@ -433,7 +411,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_resolver() {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
-        let resolver = HeaderTenantResolver::new(store, "X-Tenant-ID");
+        let resolver = HeaderTenantResolver::trusted_internal(store, "X-Tenant-ID");
 
         let mut request = create_request("GET", "/api/users");
         request
@@ -472,16 +450,19 @@ mod tests {
         )
     }
 
+    fn verified(claims: serde_json::Value) -> UserContext {
+        UserContext::new("user-1".to_string()).with_metadata(claims)
+    }
+
     #[tokio::test]
-    async fn test_jwt_resolver_valid_token() {
+    async fn test_jwt_resolver_reads_verified_context() {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
         let resolver = JwtTenantResolver::new(store, "tenant_id");
 
-        let token = make_jwt(&serde_json::json!({ "sub": "user-1", "tenant_id": "tenant-1" }));
         let mut request = create_request("GET", "/api/users");
-        request
-            .headers
-            .insert("authorization", format!("Bearer {}", token));
+        request.extensions.insert(verified(
+            serde_json::json!({ "sub": "user-1", "tenant_id": "tenant-1" }),
+        ));
 
         let tenant = resolver.resolve(&request).await.unwrap();
         assert_eq!(tenant.id, "tenant-1");
@@ -489,15 +470,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_jwt_resolver_missing_claim() {
+    async fn test_jwt_resolver_single_element_array_claim() {
+        let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
+        let resolver = JwtTenantResolver::new(store, "tenants");
+
+        let mut request = create_request("GET", "/api/users");
+        request
+            .extensions
+            .insert(verified(serde_json::json!({ "tenants": ["tenant-2"] })));
+        assert_eq!(resolver.resolve(&request).await.unwrap().id, "tenant-2");
+
+        // Ambiguous: more than one tenant cannot pick one.
+        let mut request = create_request("GET", "/api/users");
+        request.extensions.insert(verified(
+            serde_json::json!({ "tenants": ["tenant-1", "tenant-2"] }),
+        ));
+        assert!(matches!(
+            resolver.resolve(&request).await,
+            Err(TenantError::Invalid(_))
+        ));
+    }
+
+    /// H14 regression: the raw `Authorization` header is never decoded. A
+    /// forged (unsigned) token naming a tenant resolves nothing without a
+    /// verified `UserContext`.
+    #[tokio::test]
+    async fn test_jwt_resolver_ignores_raw_authorization_header() {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
         let resolver = JwtTenantResolver::new(store, "tenant_id");
 
-        let token = make_jwt(&serde_json::json!({ "sub": "user-1" }));
+        let token = make_jwt(&serde_json::json!({ "sub": "attacker", "tenant_id": "tenant-1" }));
         let mut request = create_request("GET", "/api/users");
         request
             .headers
             .insert("authorization", format!("Bearer {}", token));
+
+        assert!(matches!(
+            resolver.resolve(&request).await,
+            Err(TenantError::ResolutionFailed(_))
+        ));
+
+        // With a verified context, the verified claim wins over the header.
+        request
+            .extensions
+            .insert(verified(serde_json::json!({ "tenant_id": "tenant-2" })));
+        assert_eq!(resolver.resolve(&request).await.unwrap().id, "tenant-2");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_resolver_missing_claim() {
+        let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
+        let resolver = JwtTenantResolver::new(store, "tenant_id");
+
+        let mut request = create_request("GET", "/api/users");
+        request
+            .extensions
+            .insert(verified(serde_json::json!({ "sub": "user-1" })));
 
         let result = resolver.resolve(&request).await;
         assert!(matches!(result, Err(TenantError::ResolutionFailed(_))));
@@ -508,45 +536,25 @@ mod tests {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
         let resolver = JwtTenantResolver::new(store, "tenant_id");
 
-        let token = make_jwt(&serde_json::json!({ "tenant_id": 42 }));
-        let mut request = create_request("GET", "/api/users");
-        request
-            .headers
-            .insert("authorization", format!("Bearer {}", token));
-
-        let result = resolver.resolve(&request).await;
-        assert!(matches!(result, Err(TenantError::Invalid(_))));
-    }
-
-    #[tokio::test]
-    async fn test_jwt_resolver_malformed_token() {
-        let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
-        let resolver = JwtTenantResolver::new(store, "tenant_id");
-
-        for bad_token in [
-            "not-a-jwt",
-            "one.two",
-            "one.two.three.four",
-            "aaa.!!!not-base64!!!.ccc",
-            // Valid base64url payload, but not JSON
-            "aaa.bm90LWpzb24.ccc",
+        for bad in [
+            serde_json::json!({ "tenant_id": 42 }),
+            serde_json::json!({ "tenant_id": "" }),
+            serde_json::json!({ "tenant_id": [] }),
         ] {
             let mut request = create_request("GET", "/api/users");
-            request
-                .headers
-                .insert("authorization", format!("Bearer {}", bad_token));
-
-            let result = resolver.resolve(&request).await;
+            request.extensions.insert(verified(bad.clone()));
             assert!(
-                matches!(result, Err(TenantError::Invalid(_))),
-                "token {:?} should fail closed",
-                bad_token
+                matches!(
+                    resolver.resolve(&request).await,
+                    Err(TenantError::Invalid(_))
+                ),
+                "{bad} should fail closed"
             );
         }
     }
 
     #[tokio::test]
-    async fn test_jwt_resolver_missing_authorization_header() {
+    async fn test_jwt_resolver_missing_context() {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
         let resolver = JwtTenantResolver::new(store, "tenant_id");
 
@@ -591,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn test_header_resolver_name_case_insensitive() {
         let store: Arc<dyn TenantStore> = Arc::new(MockTenantStore::new());
-        let resolver = HeaderTenantResolver::new(store, "X-Tenant-ID");
+        let resolver = HeaderTenantResolver::trusted_internal(store, "X-Tenant-ID");
 
         let mut request = create_request("GET", "/api/users");
         request

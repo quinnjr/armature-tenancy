@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-17
+
 ### Security
 
 - **H14 — tenant IDOR closed.** `TenantMiddleware` now binds the resolved tenant to the authenticated principal: it requires the verified `armature_auth::UserContext` that `JwtAuthMiddleware` attaches (missing → `401`) and rejects a tenant that is not among the principal's tenants (`403`). Memberships are read from the verified claims in `UserContext::metadata` — the `tenants` claim (array or single string), else `tenant_id` — configurable via the new `TenantMembership`. A caller authenticated for tenant A can no longer reach tenant B by sending `X-Tenant-ID: B`, a different subdomain or path.

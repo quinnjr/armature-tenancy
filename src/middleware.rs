@@ -1,43 +1,178 @@
 //! Tenant Middleware
 //!
-//! Automatic tenant resolution middleware.
+//! Resolves the request's tenant and binds it to the authenticated principal.
+//!
+//! # Principal binding
+//!
+//! Resolving a tenant (from a header, subdomain, path or token claim) only
+//! answers *which* tenant a request is about. [`TenantMiddleware`] also checks
+//! that the caller is allowed into that tenant: it requires the verified
+//! [`UserContext`] that `armature_auth::JwtAuthMiddleware` attaches (so that
+//! middleware must be registered **before** this one) and accepts the request
+//! only if the resolved tenant's [`Tenant::id`](crate::Tenant) is one of the
+//! principal's tenants.
+//!
+//! The principal's tenants are read from the verified claim set kept in
+//! [`UserContext::metadata`], as configured by [`TenantMembership`]:
+//!
+//! - the `tenants` claim (configurable): a JSON array of tenant ids, or a
+//!   single tenant-id string;
+//! - else the `tenant_id` claim (configurable): a single tenant-id string.
+//!
+//! Outcomes: no verified `UserContext` → `401`; tenant resolved but not one of
+//! the principal's tenants → `403`.
 
 use crate::resolver::TenantResolver;
 use crate::tenant::TenantContext;
+use armature_auth::UserContext;
 use armature_core::{Error, HttpRequest, HttpResponse, Middleware};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Where the authenticated principal's tenant memberships are read from.
+///
+/// Claims are looked up in [`UserContext::metadata`], the verified claim set
+/// `armature_auth::JwtAuthMiddleware` stores there. The default reads the
+/// `tenants` claim (array of tenant ids, or a single string) and falls back to
+/// the `tenant_id` claim (single string).
+///
+/// ```
+/// use armature_auth::UserContext;
+/// use armature_tenancy::TenantMembership;
+/// use serde_json::json;
+///
+/// let user = UserContext::new("u1".to_string())
+///     .with_metadata(json!({ "tenants": ["t-1", "t-2"] }));
+/// let membership = TenantMembership::default();
+/// assert_eq!(membership.tenants_of(&user), vec!["t-1", "t-2"]);
+///
+/// let user = UserContext::new("u2".to_string()).with_metadata(json!({ "org": "t-9" }));
+/// let membership = TenantMembership::new("org");
+/// assert!(membership.is_member(&user, "t-9"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct TenantMembership {
+    tenants_claim: String,
+    single_tenant_claim: Option<String>,
+}
+
+impl TenantMembership {
+    /// Read memberships from `tenants_claim` only (array or single string).
+    pub fn new(tenants_claim: impl Into<String>) -> Self {
+        Self {
+            tenants_claim: tenants_claim.into(),
+            single_tenant_claim: None,
+        }
+    }
+
+    /// Also accept a single-tenant string claim when `tenants_claim` is absent.
+    pub fn with_single_tenant_claim(mut self, claim: impl Into<String>) -> Self {
+        self.single_tenant_claim = Some(claim.into());
+        self
+    }
+
+    /// The tenant ids the verified principal belongs to.
+    pub fn tenants_of(&self, user: &UserContext) -> Vec<String> {
+        let strings = |value: &serde_json::Value| -> Vec<String> {
+            match value {
+                serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        if let Some(value) = user.metadata.get(&self.tenants_claim) {
+            return strings(value);
+        }
+        match &self.single_tenant_claim {
+            Some(claim) => match user.metadata.get(claim) {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                _ => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether the verified principal belongs to `tenant_id`.
+    pub fn is_member(&self, user: &UserContext, tenant_id: &str) -> bool {
+        self.tenants_of(user).iter().any(|t| t == tenant_id)
+    }
+}
+
+impl Default for TenantMembership {
+    fn default() -> Self {
+        Self::new("tenants").with_single_tenant_claim("tenant_id")
+    }
+}
+
 /// Tenant middleware
 ///
-/// Automatically resolves tenant from request and stores in context.
+/// Resolves the tenant, binds it to the verified principal (see the
+/// [module docs](self)), and stores it in [`TenantContext`].
 pub struct TenantMiddleware {
     resolver: Arc<dyn TenantResolver>,
     optional: bool,
+    /// `None` only for [`TenantMiddleware::public_unverified`].
+    membership: Option<TenantMembership>,
 }
 
 impl TenantMiddleware {
-    /// Create new tenant middleware
+    /// Create new tenant middleware that binds the tenant to the principal
+    /// using [`TenantMembership::default`].
     ///
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use armature_tenancy::{TenantMiddleware, HeaderTenantResolver};
+    /// use armature_auth::JwtAuthMiddleware;
+    /// use armature_tenancy::{TenantMiddleware, SubdomainTenantResolver};
     /// use std::sync::Arc;
     ///
-    /// let resolver = Arc::new(HeaderTenantResolver::new(store, "X-Tenant-ID"));
-    /// let middleware = TenantMiddleware::new(resolver);
+    /// // JwtAuthMiddleware first: it attaches the verified UserContext.
+    /// app.middleware(Arc::new(JwtAuthMiddleware::new(jwt_manager)));
+    /// let resolver = Arc::new(SubdomainTenantResolver::new(store, "example.com"));
+    /// app.middleware(Arc::new(TenantMiddleware::new(resolver)));
     /// ```
     pub fn new(resolver: Arc<dyn TenantResolver>) -> Self {
         Self {
             resolver,
             optional: false,
+            membership: Some(TenantMembership::default()),
         }
+    }
+
+    /// Tenant middleware for public, unauthenticated pages (e.g. a tenant's
+    /// marketing site resolved by subdomain).
+    ///
+    /// **This is not an authorization check.** The tenant is resolved but not
+    /// bound to any principal; the stored [`TenantContext`] reports
+    /// [`is_principal_bound`](TenantContext::is_principal_bound) `== false`
+    /// and must only be used to pick public, per-tenant content — never to
+    /// read or write tenant data.
+    pub fn public_unverified(resolver: Arc<dyn TenantResolver>) -> Self {
+        Self {
+            resolver,
+            optional: false,
+            membership: None,
+        }
+    }
+
+    /// Use a custom membership claim layout.
+    pub fn with_membership(mut self, membership: TenantMembership) -> Self {
+        if self.membership.is_some() {
+            self.membership = Some(membership);
+        }
+        self
     }
 
     /// Make tenant resolution optional
     ///
-    /// If true, requests without valid tenant will proceed.
+    /// If true, requests whose tenant cannot be *resolved* proceed with no
+    /// tenant. A request whose tenant resolves but is not one of the
+    /// principal's tenants is still rejected with `403`.
     /// If false, requests without valid tenant will return 401.
     ///
     /// # Examples
@@ -95,15 +230,33 @@ impl Middleware for TenantMiddleware {
         // extensions, so a spoofed header can never be mistaken for a
         // resolved tenant (closes the isolation bypass).
         strip_incoming_tenant_headers(&mut request);
+        request.extensions.remove::<TenantContext>();
 
         // Resolve tenant
         match self.resolver.resolve(&request).await {
             Ok(tenant) => {
+                let context = match &self.membership {
+                    Some(membership) => {
+                        // Bind the tenant to the verified principal: a
+                        // resolver only says which tenant the request names.
+                        let user = request.extensions.get::<UserContext>().ok_or_else(|| {
+                            Error::Unauthorized(
+                                "Tenant access requires an authenticated principal".to_string(),
+                            )
+                        })?;
+                        if !membership.is_member(user, &tenant.id) {
+                            return Err(Error::Forbidden(
+                                "Principal is not a member of the requested tenant".to_string(),
+                            ));
+                        }
+                        TenantContext::bound_to_principal(tenant)
+                    }
+                    None => TenantContext::with_tenant(tenant),
+                };
+
                 // Store the resolved tenant identity in request-local,
                 // type-safe storage that clients cannot influence.
-                request
-                    .extensions
-                    .insert(TenantContext::with_tenant(tenant));
+                request.extensions.insert(context);
 
                 // Continue with request
                 next(request).await
@@ -178,6 +331,189 @@ mod tests {
         HttpRequest::new("GET", "/api/users".to_string())
     }
 
+    /// A request carrying a verified principal that belongs to `tenants`.
+    fn member_request(tenants: serde_json::Value) -> HttpRequest {
+        let mut request = create_request();
+        request.extensions.insert(
+            UserContext::new("user-1".to_string())
+                .with_metadata(serde_json::json!({ "sub": "user-1", "tenants": tenants })),
+        );
+        request
+    }
+
+    fn ok_next() -> armature_core::middleware::Next {
+        Box::new(|_req| Box::pin(async move { Ok(HttpResponse::ok()) }))
+    }
+
+    struct Store;
+
+    #[async_trait]
+    impl crate::TenantStore for Store {
+        async fn find_by_id(&self, id: &str) -> Result<Option<Tenant>, TenantError> {
+            Ok(match id {
+                "tenant-a" => Some(Tenant::new("tenant-a", "alpha")),
+                "tenant-b" => Some(Tenant::new("tenant-b", "beta")),
+                _ => None,
+            })
+        }
+        async fn find_by_name(&self, _name: &str) -> Result<Option<Tenant>, TenantError> {
+            Ok(None)
+        }
+        async fn find_by_domain(&self, _domain: &str) -> Result<Option<Tenant>, TenantError> {
+            Ok(None)
+        }
+    }
+
+    fn header_middleware() -> TenantMiddleware {
+        TenantMiddleware::new(Arc::new(crate::HeaderTenantResolver::trusted_internal(
+            Arc::new(Store),
+            "X-Tenant-ID",
+        )))
+    }
+
+    /// H14 regression: a principal verified for tenant A cannot reach tenant B
+    /// by naming it in `X-Tenant-ID`.
+    #[tokio::test]
+    async fn cross_tenant_header_is_forbidden() {
+        let mut request = member_request(serde_json::json!(["tenant-a"]));
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-b".to_string());
+
+        let result = header_middleware().handle(request, ok_next()).await;
+        assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn own_tenant_header_is_allowed_and_bound() {
+        let mut request = member_request(serde_json::json!(["tenant-a", "tenant-b"]));
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-b".to_string());
+
+        let result = header_middleware()
+            .handle(
+                request,
+                Box::new(|req| {
+                    Box::pin(async move {
+                        let ctx = req.extensions.get::<TenantContext>().unwrap();
+                        assert_eq!(ctx.tenant_id(), Some("tenant-b"));
+                        assert!(ctx.is_principal_bound());
+                        Ok(HttpResponse::ok())
+                    })
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    /// No verified `UserContext` (e.g. only a forged/unsigned bearer token in
+    /// the header, which nothing verified) → 401, no tenant attached.
+    #[tokio::test]
+    async fn unverified_request_is_unauthorized() {
+        let mut request = create_request();
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-a".to_string());
+        request.headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJub25lIn0.eyJ0ZW5hbnRzIjpbInRlbmFudC1hIl19.".to_string(),
+        );
+
+        let result = header_middleware().handle(request, ok_next()).await;
+        assert!(matches!(result, Err(Error::Unauthorized(_))), "{result:?}");
+
+        // Same through the JWT resolver: it never decodes the raw header.
+        let mw = TenantMiddleware::new(Arc::new(crate::JwtTenantResolver::new(
+            Arc::new(Store),
+            "tenant_id",
+        )));
+        let mut request = create_request();
+        request.headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJub25lIn0.eyJ0ZW5hbnRfaWQiOiJ0ZW5hbnQtYSJ9.".to_string(),
+        );
+        let result = mw.handle(request, ok_next()).await;
+        assert!(matches!(result, Err(Error::Unauthorized(_))), "{result:?}");
+    }
+
+    /// Optional mode only tolerates *unresolved* tenants; a resolved tenant
+    /// the principal does not belong to is still forbidden.
+    #[tokio::test]
+    async fn optional_mode_still_enforces_membership() {
+        let mut request = member_request(serde_json::json!("tenant-a"));
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-b".to_string());
+
+        let result = header_middleware()
+            .with_optional(true)
+            .handle(request, ok_next())
+            .await;
+        assert!(matches!(result, Err(Error::Forbidden(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn single_tenant_id_claim_fallback() {
+        let mut request = create_request();
+        request.extensions.insert(
+            UserContext::new("u".to_string())
+                .with_metadata(serde_json::json!({ "tenant_id": "tenant-a" })),
+        );
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-a".to_string());
+        assert!(header_middleware().handle(request, ok_next()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn public_unverified_resolves_without_binding() {
+        let mw = TenantMiddleware::public_unverified(Arc::new(
+            crate::HeaderTenantResolver::trusted_internal(Arc::new(Store), "X-Tenant-ID"),
+        ));
+        let mut request = create_request();
+        request
+            .headers
+            .insert("x-tenant-id", "tenant-a".to_string());
+
+        let result = mw
+            .handle(
+                request,
+                Box::new(|req| {
+                    Box::pin(async move {
+                        let ctx = req.extensions.get::<TenantContext>().unwrap();
+                        assert_eq!(ctx.tenant_id(), Some("tenant-a"));
+                        assert!(!ctx.is_principal_bound());
+                        Ok(HttpResponse::ok())
+                    })
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn preset_tenant_context_is_discarded() {
+        // A context planted before the middleware runs must never survive.
+        let mut request = create_request();
+        request
+            .extensions
+            .insert(TenantContext::with_tenant(Tenant::new("victim", "victim")));
+        let mw = TenantMiddleware::new(Arc::new(MockResolver { tenant: None })).with_optional(true);
+        let result = mw
+            .handle(
+                request,
+                Box::new(|req| {
+                    Box::pin(async move {
+                        assert_eq!(get_tenant_id(&req), None);
+                        Ok(HttpResponse::ok())
+                    })
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
     #[tokio::test]
     async fn test_middleware_with_tenant() {
         let tenant = Tenant::new("tenant-1", "acme");
@@ -186,7 +522,7 @@ mod tests {
         });
         let middleware = TenantMiddleware::new(resolver);
 
-        let request = create_request();
+        let request = member_request(serde_json::json!(["tenant-1"]));
 
         let result = middleware
             .handle(
@@ -250,7 +586,7 @@ mod tests {
         let middleware = TenantMiddleware::new(resolver);
 
         // Client tries to spoof a different tenant; the resolved one must win.
-        let mut request = create_request();
+        let mut request = member_request(serde_json::json!(["tenant-1"]));
         request.headers.insert("__tenant_id", "victim".to_string());
         request
             .headers

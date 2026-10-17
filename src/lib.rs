@@ -45,16 +45,33 @@
 //! let store: Arc<dyn TenantStore> = Arc::new(MyTenantStore::new(db_pool));
 //! container.register(store.clone());
 //!
-//! // Header-based resolution
-//! let resolver = HeaderTenantResolver::new(store, "X-Tenant-ID");
-//!
-//! // Or subdomain-based
+//! // Subdomain-based resolution
 //! let resolver = SubdomainTenantResolver::new(store, "example.com");
 //!
-//! // Add middleware
-//! let middleware = TenantMiddleware::new(Arc::new(resolver));
-//! app.middleware(Arc::new(middleware));
+//! // Or header-based, ONLY behind a gateway that sets the header itself
+//! let resolver = HeaderTenantResolver::trusted_internal(store, "X-Tenant-ID");
+//!
+//! // JwtAuthMiddleware must run first: it attaches the verified UserContext
+//! // that TenantMiddleware binds the tenant to.
+//! app.middleware(Arc::new(armature_auth::JwtAuthMiddleware::new(jwt_manager)));
+//! app.middleware(Arc::new(TenantMiddleware::new(Arc::new(resolver))));
 //! ```
+//!
+//! ## Tenant authorization
+//!
+//! Resolving a tenant never grants access to it. [`TenantMiddleware`] requires
+//! the verified `armature_auth::UserContext` (inserted by `JwtAuthMiddleware`)
+//! and checks the resolved tenant id against the principal's tenants, read
+//! from the verified token claims in `UserContext::metadata`:
+//!
+//! - `tenants`: array of tenant ids (or a single string), else
+//! - `tenant_id`: a single tenant id.
+//!
+//! Missing principal → `401`; tenant not among the principal's tenants →
+//! `403`. The claim names are configurable with [`TenantMembership`]. For
+//! public, unauthenticated per-tenant pages use
+//! [`TenantMiddleware::public_unverified`], whose context is a routing hint
+//! only ([`TenantContext::is_principal_bound`] is `false`).
 //!
 //! ## 3. Database Per Tenant (with DI)
 //!
@@ -143,7 +160,7 @@ pub use management::{
     NoOpProvisioner, TenantFilter, TenantLimits, TenantManager, TenantPlan, TenantProvisioner,
     TenantStatus, TenantUsage, UpdateTenantRequest,
 };
-pub use middleware::{TenantMiddleware, get_tenant_id, get_tenant_name};
+pub use middleware::{TenantMembership, TenantMiddleware, get_tenant_id, get_tenant_name};
 pub use resolver::{
     HeaderTenantResolver, JwtTenantResolver, PathTenantResolver, SubdomainTenantResolver,
     TenantError, TenantResolver, TenantStore,
@@ -160,7 +177,7 @@ pub mod prelude {
         TenantManager, TenantPlan, TenantProvisioner, TenantStatus, TenantUsage,
         UpdateTenantRequest,
     };
-    pub use crate::middleware::TenantMiddleware;
+    pub use crate::middleware::{TenantMembership, TenantMiddleware};
     pub use crate::resolver::{
         HeaderTenantResolver, JwtTenantResolver, PathTenantResolver, SubdomainTenantResolver,
         TenantError, TenantResolver, TenantStore,

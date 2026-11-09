@@ -12,7 +12,7 @@ keywords = ["multi-tenant", "tenancy", "saas", "isolation"]
 categories = ["web-programming"]
 
 [dependencies]
-armature-core = { version = "0.12" }
+armature-core = { version = "0.13" }
 # Verified principal (`UserContext`) that tenant membership is bound to.
 armature-auth = { version = "0.6", default-features = false }
 async-trait = "0.1"
